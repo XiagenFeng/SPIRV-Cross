@@ -3,7 +3,7 @@
 echo "Building spirv-cross"
 make -j$(nproc)
 
-export PATH="./external/glslang-build/StandAlone:./external/spirv-tools-build/tools:.:$PATH"
+export PATH="./external/glslang-build/output/bin:./external/spirv-tools-build/output/bin:.:$PATH"
 echo "Using glslangValidation in: $(which glslangValidator)."
 echo "Using spirv-opt in: $(which spirv-opt)."
 
@@ -16,4 +16,5 @@ echo "Using spirv-opt in: $(which spirv-opt)."
 ./test_shaders.py shaders-hlsl --hlsl || exit 1
 ./test_shaders.py shaders-hlsl --hlsl --opt || exit 1
 ./test_shaders.py shaders-hlsl-no-opt --hlsl || exit 1
+./test_shaders.py shaders-reflection --reflect || exit 1
 

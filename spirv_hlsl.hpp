@@ -1,5 +1,5 @@
 /*
- * Copyright 2016-2018 Robert Konrad
+ * Copyright 2016-2019 Robert Konrad
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,15 +54,31 @@ public:
 
 		// Allows the PointCoord builtin, returns float2(0.5, 0.5), as PointCoord is not supported in HLSL.
 		bool point_coord_compat = false;
+
+		// If true, the backend will assume that VertexIndex and InstanceIndex will need to apply
+		// a base offset, and you will need to fill in a cbuffer with offsets.
+		// Set to false if you know you will never use base instance or base vertex
+		// functionality as it might remove an internal cbuffer.
+		bool support_nonzero_base_vertex_base_instance = false;
 	};
 
-	CompilerHLSL(std::vector<uint32_t> spirv_)
+	explicit CompilerHLSL(std::vector<uint32_t> spirv_)
 	    : CompilerGLSL(move(spirv_))
 	{
 	}
 
-	CompilerHLSL(const uint32_t *ir, size_t size)
-	    : CompilerGLSL(ir, size)
+	CompilerHLSL(const uint32_t *ir_, size_t size)
+	    : CompilerGLSL(ir_, size)
+	{
+	}
+
+	explicit CompilerHLSL(const ParsedIR &ir_)
+	    : CompilerGLSL(ir_)
+	{
+	}
+
+	explicit CompilerHLSL(ParsedIR &&ir_)
+	    : CompilerGLSL(std::move(ir_))
 	{
 	}
 
@@ -118,9 +134,9 @@ public:
 
 private:
 	std::string type_to_glsl(const SPIRType &type, uint32_t id = 0) override;
-	std::string image_type_hlsl(const SPIRType &type);
-	std::string image_type_hlsl_modern(const SPIRType &type);
-	std::string image_type_hlsl_legacy(const SPIRType &type);
+	std::string image_type_hlsl(const SPIRType &type, uint32_t id);
+	std::string image_type_hlsl_modern(const SPIRType &type, uint32_t id);
+	std::string image_type_hlsl_legacy(const SPIRType &type, uint32_t id);
 	void emit_function_prototype(SPIRFunction &func, const Bitset &return_flags) override;
 	void emit_hlsl_entry_point();
 	void emit_header() override;
@@ -138,7 +154,7 @@ private:
 	void emit_uniform(const SPIRVariable &var) override;
 	void emit_modern_uniform(const SPIRVariable &var);
 	void emit_legacy_uniform(const SPIRVariable &var);
-	void emit_specialization_constants();
+	void emit_specialization_constants_and_structs();
 	void emit_composite_constants();
 	void emit_fixup() override;
 	std::string builtin_to_glsl(spv::BuiltIn builtin, spv::StorageClass storage) override;
@@ -158,6 +174,7 @@ private:
 	void emit_store(const Instruction &instruction);
 	void emit_atomic(const uint32_t *ops, uint32_t length, spv::Op op);
 	void emit_subgroup_op(const Instruction &i) override;
+	void emit_block_hints(const SPIRBlock &block) override;
 
 	void emit_struct_member(const SPIRType &type, uint32_t member_type_id, uint32_t index, const std::string &qualifier,
 	                        uint32_t base_offset = 0) override;

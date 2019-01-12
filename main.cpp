@@ -1,5 +1,5 @@
 /*
- * Copyright 2015-2017 ARM Limited
+ * Copyright 2015-2019 Arm Limited
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,6 +33,8 @@
 #include "spirv_hlsl.hpp"
 #include "spirv_ispc.hpp"
 #include "spirv_msl.hpp"
+#include "spirv_parser.hpp"
+#include "spirv_reflect.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -163,6 +165,22 @@ struct CLIParser
 		return val;
 	}
 
+	// Return a string only if it's not prefixed with `--`, otherwise return the default value
+	const char *next_value_string(const char *default_value)
+	{
+		if (!argc)
+		{
+			return default_value;
+		}
+
+		if (0 == strncmp("--", *argv, 2))
+		{
+			return default_value;
+		}
+
+		return next_string();
+	}
+
 	const char *next_string()
 	{
 		if (!argc)
@@ -187,7 +205,7 @@ static vector<uint32_t> read_spirv_file(const char *path)
 	FILE *file = fopen(path, "rb");
 	if (!file)
 	{
-		fprintf(stderr, "Failed to open SPIRV file: %s\n", path);
+		fprintf(stderr, "Failed to open SPIR-V file: %s\n", path);
 		return {};
 	}
 
@@ -241,8 +259,14 @@ static void print_resources(const Compiler &compiler, const char *tag, const vec
 		uint32_t fallback_id = !is_push_constant && is_block ? res.base_type_id : res.id;
 
 		uint32_t block_size = 0;
+		uint32_t runtime_array_stride = 0;
 		if (is_sized_block)
-			block_size = uint32_t(compiler.get_declared_struct_size(compiler.get_type(res.base_type_id)));
+		{
+			auto &base_type = compiler.get_type(res.base_type_id);
+			block_size = uint32_t(compiler.get_declared_struct_size(base_type));
+			runtime_array_stride = uint32_t(compiler.get_declared_struct_size_runtime_array(base_type, 1) -
+			                                compiler.get_declared_struct_size_runtime_array(base_type, 0));
+		}
 
 		Bitset mask;
 		if (print_ssbo)
@@ -270,7 +294,11 @@ static void print_resources(const Compiler &compiler, const char *tag, const vec
 		if (mask.get(DecorationNonWritable))
 			fprintf(stderr, " readonly");
 		if (is_sized_block)
+		{
 			fprintf(stderr, " (BlockSize : %u bytes)", block_size);
+			if (runtime_array_stride)
+				fprintf(stderr, " (Unsized array stride: %u bytes)", runtime_array_stride);
+		}
 
 		uint32_t counter_id = 0;
 		if (print_ssbo && compiler.buffer_get_hlsl_counter_buffer(res.id, counter_id))
@@ -478,6 +506,9 @@ struct CLIArguments
 	bool sso = false;
 	bool ispc_ignore_runtimearray_padding = false;
 	bool ispc_ignore_group_barriers = false;
+	bool support_nonzero_baseinstance = true;
+	bool msl_swizzle_texture_samples = false;
+	bool msl_ios = false;
 	vector<PLSArg> pls_in;
 	vector<PLSArg> pls_out;
 	vector<Remap> remaps;
@@ -498,9 +529,11 @@ struct CLIArguments
 
 	uint32_t iterations = 1;
 	bool cpp = false;
+	string reflect;
 	bool msl = false;
 	bool hlsl = false;
 	bool hlsl_compat = false;
+	bool hlsl_support_nonzero_base = false;
 	bool vulkan_semantics = false;
 	bool flatten_multidimensional_arrays = false;
 	bool use_420pack_extension = true;
@@ -530,13 +563,17 @@ static void print_help()
 	                "\t[--cpp-interface-name <name>]\n"
 	                "\t[--msl]\n"
 	                "\t[--msl-version <MMmmpp>]\n"
+	                "\t[--msl-swizzle-texture-samples]\n"
+	                "\t[--msl-ios]\n"
 	                "\t[--hlsl]\n"
+	                "\t[--reflect]\n"
 	                "\t[--shader-model]\n"
 	                "\t[--hlsl-enable-compat]\n"
 	                "\t[--ispc]\n"
 	                "\t[--ispc-interface-name]\n"
 	                "\t[--ispc-ignore-runtimearray-padding]\n"
 	                "\t[--ispc-ignore-group-barriers]\n"
+	                "\t[--hlsl-support-nonzero-basevertex-baseinstance]\n"
 	                "\t[--separate-shader-objects]\n"
 	                "\t[--pls-in format input-name]\n"
 	                "\t[--pls-out format output-name]\n"
@@ -551,7 +588,8 @@ static void print_help()
 	                "\t[--rename-interface-variable <in|out> <location> <new_variable_name>]\n"
 	                "\t[--set-hlsl-vertex-input-semantic <location> <semantic>]\n"
 	                "\t[--rename-entry-point <old> <new> <stage>]\n"
-	                "\t[--combined-samplers-inherit-bindings]"
+	                "\t[--combined-samplers-inherit-bindings]\n"
+	                "\t[--no-support-nonzero-baseinstance]\n"
 	                "\n");
 }
 
@@ -686,6 +724,7 @@ static int main_inner(int argc, char *argv[])
 	cbs.add("--flip-vert-y", [&args](CLIParser &) { args.yflip = true; });
 	cbs.add("--iterations", [&args](CLIParser &parser) { args.iterations = parser.next_uint(); });
 	cbs.add("--cpp", [&args](CLIParser &) { args.cpp = true; });
+	cbs.add("--reflect", [&args](CLIParser &parser) { args.reflect = parser.next_value_string("json"); });
 	cbs.add("--cpp-interface-name", [&args](CLIParser &parser) { args.cpp_interface_name = parser.next_string(); });
 	cbs.add("--metal", [&args](CLIParser &) { args.msl = true; }); // Legacy compatibility
 	cbs.add("--msl", [&args](CLIParser &) { args.msl = true; });
@@ -700,9 +739,13 @@ static int main_inner(int argc, char *argv[])
 	cbs.add("--ispc-ignore-runtimearray-padding",
 	        [&args](CLIParser &) { args.ispc_ignore_runtimearray_padding = true; });
 	cbs.add("--ispc-ignore-group-barriers", [&args](CLIParser &) { args.ispc_ignore_group_barriers = true; });
+	cbs.add("--hlsl-support-nonzero-basevertex-baseinstance",
+	        [&args](CLIParser &) { args.hlsl_support_nonzero_base = true; });
 	cbs.add("--vulkan-semantics", [&args](CLIParser &) { args.vulkan_semantics = true; });
 	cbs.add("--flatten-multidimensional-arrays", [&args](CLIParser &) { args.flatten_multidimensional_arrays = true; });
 	cbs.add("--no-420pack-extension", [&args](CLIParser &) { args.use_420pack_extension = false; });
+	cbs.add("--msl-swizzle-texture-samples", [&args](CLIParser &) { args.msl_swizzle_texture_samples = true; });
+	cbs.add("--msl-ios", [&args](CLIParser &) { args.msl_ios = true; });
 	cbs.add("--extension", [&args](CLIParser &parser) { args.extensions.push_back(parser.next_string()); });
 	cbs.add("--rename-entry-point", [&args](CLIParser &parser) {
 		auto old_name = parser.next_string();
@@ -769,6 +812,8 @@ static int main_inner(int argc, char *argv[])
 	cbs.add("--combined-samplers-inherit-bindings",
 	        [&args](CLIParser &) { args.combined_samplers_inherit_bindings = true; });
 
+	cbs.add("--no-support-nonzero-baseinstance", [&](CLIParser &) { args.support_nonzero_baseinstance = false; });
+
 	cbs.default_handler = [&args](const char *value) { args.input = value; };
 	cbs.error_handler = [] { print_help(); };
 
@@ -789,32 +834,54 @@ static int main_inner(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	unique_ptr<CompilerGLSL> compiler;
+	auto spirv_file = read_spirv_file(args.input);
+	if (spirv_file.empty())
+		return EXIT_FAILURE;
+	Parser spirv_parser(move(spirv_file));
 
+	spirv_parser.parse();
+
+	// Special case reflection because it has little to do with the path followed by code-outputting compilers
+	if (!args.reflect.empty())
+	{
+		CompilerReflection compiler(move(spirv_parser.get_parsed_ir()));
+		compiler.set_format(args.reflect);
+		auto json = compiler.compile();
+		if (args.output)
+			write_string_to_file(args.output, json.c_str());
+		else
+			printf("%s", json.c_str());
+		return EXIT_SUCCESS;
+	}
+
+	unique_ptr<CompilerGLSL> compiler;
 	bool combined_image_samplers = false;
 	bool build_dummy_sampler = false;
 
 	if (args.cpp)
 	{
-		compiler = unique_ptr<CompilerGLSL>(new CompilerCPP(read_spirv_file(args.input)));
+		compiler.reset(new CompilerCPP(move(spirv_parser.get_parsed_ir())));
 		if (args.cpp_interface_name)
 			static_cast<CompilerCPP *>(compiler.get())->set_interface_name(args.cpp_interface_name);
 	}
 	else if (args.msl)
 	{
-		compiler = unique_ptr<CompilerMSL>(new CompilerMSL(read_spirv_file(args.input)));
+		compiler.reset(new CompilerMSL(move(spirv_parser.get_parsed_ir())));
 
 		auto *msl_comp = static_cast<CompilerMSL *>(compiler.get());
 		auto msl_opts = msl_comp->get_msl_options();
 		if (args.set_msl_version)
 			msl_opts.msl_version = args.msl_version;
+		msl_opts.swizzle_texture_samples = args.msl_swizzle_texture_samples;
+		if (args.msl_ios)
+			msl_opts.platform = CompilerMSL::Options::iOS;
 		msl_comp->set_msl_options(msl_opts);
 	}
 	else if (args.hlsl)
-		compiler = unique_ptr<CompilerHLSL>(new CompilerHLSL(read_spirv_file(args.input)));
+		compiler.reset(new CompilerHLSL(move(spirv_parser.get_parsed_ir())));
 	else if (args.ispc)
 	{
-		compiler = unique_ptr<CompilerISPC>(new CompilerISPC(read_spirv_file(args.input)));
+		compiler.reset(new CompilerISPC(move(spirv_parser.get_parsed_ir())));
 		if (args.ispc_interface_name)
 			static_cast<CompilerISPC *>(compiler.get())->set_interface_name(args.ispc_interface_name);
 		else
@@ -841,8 +908,9 @@ static int main_inner(int argc, char *argv[])
 	else
 	{
 		combined_image_samplers = !args.vulkan_semantics;
-		build_dummy_sampler = true;
-		compiler = unique_ptr<CompilerGLSL>(new CompilerGLSL(read_spirv_file(args.input)));
+		if (!args.vulkan_semantics)
+			build_dummy_sampler = true;
+		compiler.reset(new CompilerGLSL(move(spirv_parser.get_parsed_ir())));
 	}
 
 	if (!args.variable_type_remaps.empty())
@@ -953,6 +1021,7 @@ static int main_inner(int argc, char *argv[])
 	opts.vulkan_semantics = args.vulkan_semantics;
 	opts.vertex.fixup_clipspace = args.fixup;
 	opts.vertex.flip_vert_y = args.yflip;
+	opts.vertex.support_nonzero_base_instance = args.support_nonzero_baseinstance;
 	compiler->set_common_options(opts);
 
 	// Set HLSL specific options.
@@ -977,6 +1046,14 @@ static int main_inner(int argc, char *argv[])
 			hlsl_opts.point_size_compat = true;
 			hlsl_opts.point_coord_compat = true;
 		}
+
+		if (hlsl_opts.shader_model <= 30)
+		{
+			combined_image_samplers = true;
+			build_dummy_sampler = true;
+		}
+
+		hlsl_opts.support_nonzero_base_vertex_base_instance = args.hlsl_support_nonzero_base;
 		hlsl->set_hlsl_options(hlsl_opts);
 	}
 
